@@ -126,7 +126,6 @@ disaster-tweet-classifier/
 │   └── vendor/chart.umd.min.js      # vendored Chart.js (no CDN dependency)
 ├── assets/                          # generated charts, word clouds, screenshots, diagram
 ├── requirements.txt
-├── PITCH.md                         # 60-second judge pitch
 └── README.md
 ```
 
