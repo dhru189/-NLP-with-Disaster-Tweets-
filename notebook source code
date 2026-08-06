@@ -1,0 +1,408 @@
+# %% [markdown]
+# 
+# ### NLP with Disaster Tweets — Real Disaster vs. Figurative Language
+#
+# **Domain:** Social Media / Civic
+#
+# **Problem Statement:** During disasters, emergency services are overwhelmed with
+# social media data. This notebook builds an NLP classifier that identifies **real
+# disaster tweets** from **figurative ones** (e.g. "this exam was a disaster") to
+# help emergency teams triage social media faster.
+#
+# **Dataset:** Kaggle — [NLP with Disaster Tweets](https://www.kaggle.com/c/nlp-getting-started)
+# (7,613 labeled tweets: `id`, `keyword`, `location`, `text`, `target`)
+#
+# **Pipeline (required core approach):**
+# 1. Clean tweets using regex (remove URLs, hashtags, mentions)
+# 2. Tokenize and preprocess using NLTK (stopwords + lemmatization)
+# 3. TF-IDF vectorization
+# 4. Train SVM / Logistic Regression **+ Naive Bayes, Random Forest, Gradient Boosting** for comparison
+# 5. Evaluate using F1-score, confusion matrix, ROC-AUC, and 5-fold cross-validation
+#
+# ---
+
+# %% [markdown]
+# ## 1. Setup
+
+# %%
+import sys, os, re, json
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from wordcloud import WordCloud
+
+import nltk
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from nltk.tokenize import word_tokenize
+
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, confusion_matrix, classification_report, roc_curve, RocCurveDisplay
+)
+
+sns.set_theme(style="whitegrid")
+DISASTER_COLOR = "#E8543A"
+SAFE_COLOR = "#2AA198"
+RANDOM_STATE = 42
+pd.set_option("display.max_colwidth", 90)
+
+# %% [markdown]
+# ## 2. Load the data
+
+# %%
+df = pd.read_csv("../data/train.csv")
+df["keyword"] = df["keyword"].fillna("")
+df["location"] = df["location"].fillna("")
+print("Shape:", df.shape)
+df.head()
+
+# %%
+df.info()
+
+# %% [markdown]
+# ## 3. Exploratory Data Analysis (EDA)
+
+# %% [markdown]
+# ### 3.1 Target distribution
+# The dataset is mildly imbalanced: ~57% "not a disaster" vs ~43% "real disaster".
+
+# %%
+counts = df["target"].value_counts().sort_index()
+fig, ax = plt.subplots(figsize=(6, 4.5))
+ax.bar(["Not a Disaster", "Real Disaster"], counts.values, color=[SAFE_COLOR, DISASTER_COLOR])
+for i, c in enumerate(counts.values):
+    ax.text(i, c + 50, str(c), ha="center", fontweight="bold")
+ax.set_title("Target Distribution", fontsize=14, fontweight="bold")
+ax.set_ylabel("Number of Tweets")
+plt.tight_layout()
+plt.savefig("../assets/target_distribution.png", dpi=140)
+plt.show()
+
+print(f"Real disaster:      {counts[1]} ({counts[1]/len(df):.1%})")
+print(f"Not a disaster:     {counts[0]} ({counts[0]/len(df):.1%})")
+
+# %% [markdown]
+# ### 3.2 Tweet length & word count by class
+
+# %%
+df["char_len"] = df["text"].str.len()
+df["word_count"] = df["text"].str.split().apply(len)
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 4.5))
+for ax, col, title in zip(axes, ["char_len", "word_count"], ["Character length", "Word count"]):
+    sns.kdeplot(df[df.target == 1][col], label="Real Disaster", color=DISASTER_COLOR, fill=True, alpha=0.4, ax=ax)
+    sns.kdeplot(df[df.target == 0][col], label="Not a Disaster", color=SAFE_COLOR, fill=True, alpha=0.4, ax=ax)
+    ax.set_title(f"{title} distribution by class", fontweight="bold")
+    ax.legend()
+plt.tight_layout()
+plt.savefig("../assets/word_count_dist.png", dpi=140)
+plt.show()
+
+df.groupby("target")[["char_len", "word_count"]].mean().round(1)
+
+# %% [markdown]
+# **Observation:** Real disaster tweets tend to run slightly longer — people
+# reporting an actual emergency pack in more concrete detail (location, what
+# happened, casualty/damage counts) than a short figurative one-liner.
+
+# %% [markdown]
+# ## 4. Text Preprocessing
+#
+# **Stage 1 — Regex cleaning:** lowercase, strip URLs, `@mentions`, HTML
+# entities, the `#` symbol (the hashtag *word* is kept — e.g. `#earthquake` →
+# `earthquake` — since it's a strong signal), punctuation and digits.
+#
+# **Stage 2 — NLTK preprocessing:** tokenize → remove stopwords (negations
+# like "not"/"no" are deliberately kept, since they can flip a tweet's
+# meaning) → lemmatize with `WordNetLemmatizer`.
+
+# %%
+STOPWORDS = set(stopwords.words("english")) - {"no", "not", "nor", "none", "never", "n't"}
+LEMMATIZER = WordNetLemmatizer()
+
+URL_RE = re.compile(r"https?://\S+|www\.\S+")
+MENTION_RE = re.compile(r"@\w+")
+HASHTAG_SYMBOL_RE = re.compile(r"#")
+HTML_ENTITY_RE = re.compile(r"&\w+;")
+NON_ALPHA_RE = re.compile(r"[^a-zA-Z\s]")
+MULTI_SPACE_RE = re.compile(r"\s+")
+
+
+def clean_tweet(text: str) -> str:
+    text = text.lower()
+    text = URL_RE.sub(" ", text)
+    text = MENTION_RE.sub(" ", text)
+    text = HTML_ENTITY_RE.sub(" ", text)
+    text = HASHTAG_SYMBOL_RE.sub("", text)
+    text = NON_ALPHA_RE.sub(" ", text)
+    return MULTI_SPACE_RE.sub(" ", text).strip()
+
+
+def preprocess(text: str) -> str:
+    cleaned = clean_tweet(text)
+    tokens = [t for t in word_tokenize(cleaned) if t not in STOPWORDS and len(t) > 1]
+    tokens = [LEMMATIZER.lemmatize(t) for t in tokens]
+    return " ".join(tokens)
+
+
+# demo on the two examples from the brief
+for demo in [
+    "Massive flood in Ahmedabad — roads submerged near Sardar Bridge.",
+    "My exam results are a complete disaster lol",
+]:
+    print(f"RAW:     {demo}")
+    print(f"CLEANED: {clean_tweet(demo)}")
+    print(f"FINAL:   {preprocess(demo)}")
+    print()
+
+# %%
+df["clean_text"] = df["text"].apply(preprocess)
+df = df[df["clean_text"].str.len() > 0].reset_index(drop=True)
+df[["text", "clean_text"]].sample(5, random_state=7)
+
+# %% [markdown]
+# ### 4.1 Most frequent words, bigrams & trigrams per class
+
+# %%
+def top_ngrams(texts, n=1, top_k=15):
+    counter = Counter()
+    for t in texts:
+        tokens = t.split()
+        grams = tokens if n == 1 else [" ".join(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
+        counter.update(grams)
+    return counter.most_common(top_k)
+
+real_text = df[df.target == 1]["clean_text"]
+not_real_text = df[df.target == 0]["clean_text"]
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+for ax, (title, data, color) in zip(axes, [
+    ("Top words — Real Disaster", top_ngrams(real_text, 1, 12), DISASTER_COLOR),
+    ("Top words — Not a Disaster", top_ngrams(not_real_text, 1, 12), SAFE_COLOR),
+]):
+    words, cnts = zip(*data)
+    ax.barh(words[::-1], cnts[::-1], color=color)
+    ax.set_title(title, fontweight="bold")
+plt.tight_layout()
+plt.savefig("../assets/top_words.png", dpi=140)
+plt.show()
+
+print("Top bigrams (Real Disaster):", top_ngrams(real_text, 2, 8))
+print("Top bigrams (Not a Disaster):", top_ngrams(not_real_text, 2, 8))
+print("Top trigrams (Real Disaster):", top_ngrams(real_text, 3, 5))
+
+# %% [markdown]
+# ### 4.2 Word clouds
+
+# %%
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+for ax, (name, texts, cmap) in zip(axes, [
+    ("Real Disaster Tweets", real_text, "Reds"), ("Non-Disaster Tweets", not_real_text, "Greens")
+]):
+    wc = WordCloud(width=800, height=450, background_color="white", colormap=cmap, max_words=100)
+    wc.generate(" ".join(texts))
+    ax.imshow(wc, interpolation="bilinear")
+    ax.axis("off")
+    ax.set_title(name, fontsize=14, fontweight="bold")
+plt.tight_layout()
+plt.savefig("../assets/wordclouds.png", dpi=140)
+plt.show()
+
+# %% [markdown]
+# ### 4.3 Keyword & location signal
+# The dataset ships an optional `keyword` field pulled from the tweet. Some
+# keywords are almost perfectly predictive on their own.
+
+# %%
+kw = df[df["keyword"] != ""].copy()
+kw["keyword"] = kw["keyword"].str.replace("%20", " ", regex=False)
+rate = kw.groupby("keyword")["target"].agg(["mean", "count"])
+rate = rate[rate["count"] >= 5]
+
+print("Most disaster-associated keywords:")
+print(rate.sort_values("mean", ascending=False).head(10))
+print("\nLeast disaster-associated keywords:")
+print(rate.sort_values("mean", ascending=True).head(10))
+
+# %% [markdown]
+# ## 5. Feature Engineering — TF-IDF
+# Unigrams + bigrams, top 2,500 terms by document frequency (`min_df=2`).
+# This vocabulary size is also what gets exported for the client-side live
+# demo, so keeping it lean matters for both model quality and portability.
+
+# %%
+X_text = df["clean_text"].values
+y = df["target"].values
+
+X_train_text, X_test_text, y_train, y_test = train_test_split(
+    X_text, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+)
+
+vectorizer = TfidfVectorizer(max_features=2500, ngram_range=(1, 2), min_df=2, norm="l2", smooth_idf=True)
+X_train = vectorizer.fit_transform(X_train_text)
+X_test = vectorizer.transform(X_test_text)
+print("TF-IDF matrix shape:", X_train.shape)
+
+# %% [markdown]
+# ## 6. Model Training & Comparison
+#
+# Required baseline (**Logistic Regression / SVM**) plus three additional
+# models for a stronger comparison: **Multinomial Naive Bayes**, **Random
+# Forest**, and **Gradient Boosting**.
+
+# %%
+models = {
+    "Logistic Regression": LogisticRegression(max_iter=1000, C=1.0, random_state=RANDOM_STATE),
+    "Linear SVM": CalibratedClassifierCV(LinearSVC(C=1.0, random_state=RANDOM_STATE, max_iter=5000), cv=3),
+    "Multinomial Naive Bayes": MultinomialNB(alpha=0.5),
+    "Random Forest": RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE, n_jobs=-1),
+    "Gradient Boosting": GradientBoostingClassifier(n_estimators=200, max_depth=3, random_state=RANDOM_STATE),
+}
+
+results = {}
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+for name, model in models.items():
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    y_proba = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else None
+    cv_f1 = cross_val_score(model, X_train, y_train, cv=skf, scoring="f1", n_jobs=-1)
+
+    results[name] = {
+        "accuracy": accuracy_score(y_test, y_pred),
+        "precision": precision_score(y_test, y_pred),
+        "recall": recall_score(y_test, y_pred),
+        "f1": f1_score(y_test, y_pred),
+        "roc_auc": roc_auc_score(y_test, y_proba) if y_proba is not None else np.nan,
+        "cv_f1_mean": cv_f1.mean(),
+        "cv_f1_std": cv_f1.std(),
+    }
+    print(f"{name:<26} Acc={results[name]['accuracy']:.3f}  F1={results[name]['f1']:.3f}  "
+          f"AUC={results[name]['roc_auc']:.3f}  CV-F1={cv_f1.mean():.3f}±{cv_f1.std():.3f}")
+
+# %% [markdown]
+# ### 6.1 Comparison table
+
+# %%
+results_df = pd.DataFrame(results).T.round(4)
+results_df = results_df.sort_values("f1", ascending=False)
+results_df
+
+# %%
+fig, ax = plt.subplots(figsize=(9, 5))
+results_df["f1"].sort_values().plot(kind="barh", color=DISASTER_COLOR, ax=ax)
+ax.set_title("Model Comparison — Test F1-score", fontweight="bold")
+ax.set_xlabel("F1-score")
+plt.tight_layout()
+plt.savefig("../assets/model_comparison.png", dpi=140)
+plt.show()
+
+# %% [markdown]
+# ## 7. Detailed Evaluation of the Best Model
+
+# %%
+best_name = results_df.index[0]
+best_model = models[best_name]
+print(f"Best model by F1: {best_name}")
+
+y_pred = best_model.predict(X_test)
+y_proba = best_model.predict_proba(X_test)[:, 1]
+
+print(classification_report(y_test, y_pred, target_names=["NOT A DISASTER", "REAL DISASTER"]))
+
+# %%
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+cm = confusion_matrix(y_test, y_pred)
+sns.heatmap(cm, annot=True, fmt="d", cmap="OrRd", ax=axes[0],
+            xticklabels=["Not a Disaster", "Real Disaster"],
+            yticklabels=["Not a Disaster", "Real Disaster"])
+axes[0].set_title(f"Confusion Matrix — {best_name}", fontweight="bold")
+axes[0].set_ylabel("Actual")
+axes[0].set_xlabel("Predicted")
+
+RocCurveDisplay.from_predictions(y_test, y_proba, ax=axes[1], color=DISASTER_COLOR)
+axes[1].plot([0, 1], [0, 1], linestyle="--", color="gray")
+axes[1].set_title(f"ROC Curve — {best_name}", fontweight="bold")
+
+plt.tight_layout()
+plt.savefig("../assets/confusion_roc.png", dpi=140)
+plt.show()
+
+# %% [markdown]
+# ## 8. Feature Importance — Top Contributing Words
+# Logistic Regression coefficients tell us which TF-IDF terms push a tweet
+# toward "REAL DISASTER" (positive) vs. "NOT A DISASTER" (negative).
+
+# %%
+lr = models["Logistic Regression"]
+feature_names = np.array(vectorizer.get_feature_names_out())
+coefs = lr.coef_[0]
+
+top_pos = np.argsort(coefs)[-15:][::-1]
+top_neg = np.argsort(coefs)[:15]
+
+fig, ax = plt.subplots(figsize=(9, 7))
+words = list(feature_names[top_pos][::-1]) + list(feature_names[top_neg][::-1])
+weights = list(coefs[top_pos][::-1]) + list(coefs[top_neg][::-1])
+colors = [DISASTER_COLOR if w > 0 else SAFE_COLOR for w in weights]
+ax.barh(words, weights, color=colors)
+ax.axvline(0, color="black", linewidth=0.8)
+ax.set_title("Top TF-IDF Features Driving Each Class (Logistic Regression)", fontweight="bold")
+ax.set_xlabel("Coefficient (→ Real Disaster | ← Not a Disaster)")
+plt.tight_layout()
+plt.savefig("../assets/feature_importance.png", dpi=140)
+plt.show()
+
+# %% [markdown]
+# ## 9. Try it yourself
+
+# %%
+def predict_tweet(text, model=best_model, vec=vectorizer):
+    clean = preprocess(text)
+    vec_x = vec.transform([clean])
+    proba = model.predict_proba(vec_x)[0, 1]
+    label = "REAL DISASTER" if proba >= 0.5 else "NOT A DISASTER"
+    return label, proba
+
+for t in [
+    "Massive flood in Ahmedabad — roads submerged near Sardar Bridge.",
+    "My exam results are a complete disaster lol",
+    "BREAKING: 6.2 magnitude earthquake strikes coastal region, tsunami alert issued",
+    "this game's matchmaking is an absolute disaster today",
+]:
+    label, proba = predict_tweet(t)
+    print(f"[{label:14s} {proba:.1%}]  {t}")
+
+# %% [markdown]
+# ## 10. Conclusion & Next Steps
+#
+# - **Logistic Regression** (TF-IDF, unigrams+bigrams) is the strongest,
+#   most efficient model in this comparison — it edges out Linear SVM and
+#   Naive Bayes on F1 and ROC-AUC while training in well under a second and
+#   staying small enough (~140KB of weights) to run **client-side in a
+#   browser**, which is what powers the "Live Classifier" tab of the
+#   dashboard.
+# - Random Forest and Gradient Boosting don't beat the linear models here —
+#   expected for sparse, high-dimensional TF-IDF text features, where linear
+#   decision boundaries tend to generalize better than trees.
+# - **Stretch goal (not run in this notebook due to compute/time budget):**
+#   fine-tuning a lightweight transformer (e.g. DistilBERT) typically pushes
+#   F1 into the high 0.80s on this dataset by capturing context that
+#   bag-of-words TF-IDF misses (e.g. sarcasm, multi-word idioms). A stub for
+#   this is included in `src/bert_stretch_goal.py`.
+#
+# The trained Logistic Regression + TF-IDF vectorizer are exported to
+# `models/production_model.json` for the interactive dashboard — see
+# `src/train.py::export_production_model`.
